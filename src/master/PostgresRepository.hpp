@@ -178,83 +178,181 @@ public:
     }
   }
 
+  // --- DEDUPLICATION CHECK & SHARD ROUTING ---
   std::vector<ChunkRoutingPlan> FilterMissingChunks(const std::vector<std::string> &client_hashes) override
   {
     std::vector<ChunkRoutingPlan> missing_plans;
+    if (client_hashes.empty())
+      return missing_plans;
+
+    // 1. Deduplicate input while PRESERVING ORIGINAL ORDER
+    std::vector<std::string> ordered_unique;
+    std::unordered_set<std::string> seen_hashes;
+    for (const auto &hash : client_hashes)
+    {
+      if (seen_hashes.insert(hash).second)
+      {
+        ordered_unique.push_back(hash);
+      }
+    }
+
+    // 2. DEADLOCK PREVENTION: Sort hashes to guarantee deterministic lock acquisition
+    std::vector<std::string> sorted_unique = ordered_unique;
+    std::sort(sorted_unique.begin(), sorted_unique.end());
+
+    std::string pg_hash_array = "{";
+    for (size_t i = 0; i < sorted_unique.size(); ++i)
+    {
+      pg_hash_array += sorted_unique[i];
+      if (i < sorted_unique.size() - 1)
+        pg_hash_array += ",";
+    }
+    pg_hash_array += "}";
+
     pqxx::connection conn(connection_string);
     pqxx::work txn(conn);
 
-    for (const auto &hash : client_hashes)
+    // 3. THE CTE SUPER-QUERY: Locks -> Updates -> Fetches JSON in ONE round-trip
+    pqxx::result existing_res = txn.exec_params(
+        "WITH locked AS ("
+        "  SELECT c.chunk_hash "
+        "  FROM unnest($1::varchar[]) AS u(h) "
+        "  JOIN chunks c ON c.chunk_hash = u.h "
+        "  ORDER BY u.h FOR UPDATE"
+        "), "
+        "updated AS ("
+        "  UPDATE chunks c "
+        "  SET created_at = CURRENT_TIMESTAMP "
+        "  FROM locked "
+        "  WHERE c.chunk_hash = locked.chunk_hash "
+        "  RETURNING c.chunk_hash, c.ref_count, c.nodes"
+        ") "
+        "SELECT u.chunk_hash, u.ref_count, "
+        "  (SELECT json_agg(json_build_object("
+        "     'internal_coord', w.internal_host || ':' || w.internal_port, "
+        "     'advertised_host', w.advertised_host, "
+        "     'advertised_port', w.advertised_port"
+        "  )) FROM worker_nodes w WHERE w.worker_id = ANY(u.nodes)) AS node_data "
+        "FROM updated u;",
+        pg_hash_array);
+
+    std::unordered_set<std::string> found_hashes;
+    std::unordered_map<std::string, ChunkRoutingPlan> plan_map;
+
+    // 4. Process existing chunks in RAM
+    for (const auto &row : existing_res)
     {
-      pqxx::result res = txn.exec_params(
-          "SELECT ref_count, nodes, "
+      std::string hash = row[0].as<std::string>();
+      int ref_count = row[1].as<int>();
+
+      found_hashes.insert(hash);
+
+      // TOCTOU Fix: Exception forces txn.abort() - rolling back the CTE update instantly!
+      if (ref_count == -1)
+      {
+        throw std::runtime_error("CHUNK_LOCKED");
+      }
+
+      // If chunk is physically missing (0), store its routing plan
+      if (ref_count == 0)
+      {
+        std::string json_nodes_data = row[2].is_null() ? "[]" : row[2].as<std::string>();
+        plan_map[hash] = ParseNodePlanFromJson(hash, json_nodes_data);
+      }
+    }
+
+    // 5. Identify genuinely missing hashes
+    std::vector<std::string> missing_hashes;
+    for (const auto &hash : ordered_unique)
+    {
+      if (found_hashes.find(hash) == found_hashes.end())
+      {
+        missing_hashes.push_back(hash);
+      }
+    }
+
+    // 6. BULK INSERT: Resolve routing and insert missing chunks
+    if (!missing_hashes.empty())
+    {
+      std::unordered_set<int> required_buckets;
+      for (const auto &hash : missing_hashes)
+      {
+        required_buckets.insert(CalculateBucketId(hash, num_buckets));
+      }
+
+      std::string pg_bucket_array = "{";
+      size_t b_idx = 0;
+      for (int b_id : required_buckets)
+      {
+        pg_bucket_array += std::to_string(b_id);
+        if (++b_idx < required_buckets.size())
+          pg_bucket_array += ",";
+      }
+      pg_bucket_array += "}";
+
+      pqxx::result routing_res = txn.exec_params(
+          "SELECT s.bucket_id, c.active_nodes, "
           "(SELECT json_agg(json_build_object("
           "   'internal_coord', internal_host || ':' || internal_port, "
           "   'advertised_host', advertised_host, "
           "   'advertised_port', advertised_port"
-          ")) FROM worker_nodes WHERE worker_id = ANY(chunks.nodes)) AS node_data "
-          "FROM chunks WHERE chunk_hash = $1",
-          hash);
+          ")) FROM worker_nodes WHERE worker_id = ANY(c.active_nodes)) AS node_data "
+          "FROM shard_map s "
+          "JOIN clusters c ON s.cluster_id = c.cluster_id "
+          "WHERE s.bucket_id = ANY($1::integer[])",
+          pg_bucket_array);
 
-      if (res.empty())
+      std::unordered_map<int, std::pair<std::string, std::string>> bucket_routes;
+      for (const auto &row : routing_res)
       {
-        int bucket_id = CalculateBucketId(hash, num_buckets);
-
-        pqxx::result routing_res = txn.exec_params(
-            "SELECT c.active_nodes, "
-            "(SELECT json_agg(json_build_object("
-            "   'internal_coord', internal_host || ':' || internal_port, "
-            "   'advertised_host', advertised_host, "
-            "   'advertised_port', advertised_port"
-            ")) FROM worker_nodes WHERE worker_id = ANY(c.active_nodes)) AS node_data "
-            "FROM shard_map s "
-            "JOIN clusters c ON s.cluster_id = c.cluster_id "
-            "WHERE s.bucket_id = $1",
-            bucket_id);
-
-        if (routing_res.empty())
-        {
-          throw std::runtime_error("Shard map uninitialized for bucket " + std::to_string(bucket_id));
-        }
-
-        std::string pg_nodes_array = routing_res[0][0].as<std::string>();
-        std::string json_nodes_data = routing_res[0][1].as<std::string>();
-
-        txn.exec_params(
-            "INSERT INTO chunks (chunk_hash, nodes, ref_count, created_at) VALUES ($1, $2, 0, CURRENT_TIMESTAMP) "
-            "ON CONFLICT (chunk_hash) DO NOTHING",
-            hash, pg_nodes_array);
-
-        missing_plans.push_back(ParseNodePlanFromJson(hash, json_nodes_data));
+        bucket_routes[row[0].as<int>()] = {row[1].as<std::string>(), row[2].as<std::string>()};
       }
-      else
+
+      std::string bulk_insert_query = "INSERT INTO chunks (chunk_hash, nodes, ref_count, created_at) VALUES ";
+
+      for (size_t i = 0; i < missing_hashes.size(); ++i)
       {
-        int ref_count = res[0][0].as<int>();
+        const std::string &hash = missing_hashes[i];
+        int b_id = CalculateBucketId(hash, num_buckets);
 
-        if (ref_count == -1)
+        if (bucket_routes.find(b_id) == bucket_routes.end())
         {
-          throw std::runtime_error("CHUNK_LOCKED");
+          throw std::runtime_error("Shard map uninitialized for bucket " + std::to_string(b_id));
         }
-        else
-        {
-          txn.exec_params("UPDATE chunks SET created_at = CURRENT_TIMESTAMP WHERE chunk_hash = $1", hash);
 
-          if (ref_count == 0)
-          {
-            std::string json_nodes_data = res[0][2].as<std::string>();
-            missing_plans.push_back(ParseNodePlanFromJson(hash, json_nodes_data));
-          }
-        }
+        const std::string &pg_nodes_array = bucket_routes[b_id].first;
+        const std::string &json_nodes_data = bucket_routes[b_id].second;
+
+        bulk_insert_query += "('" + txn.esc(hash) + "', '" + pg_nodes_array + "'::integer[], 0, CURRENT_TIMESTAMP)";
+        if (i < missing_hashes.size() - 1)
+          bulk_insert_query += ", ";
+
+        plan_map[hash] = ParseNodePlanFromJson(hash, json_nodes_data);
       }
+      bulk_insert_query += " ON CONFLICT (chunk_hash) DO NOTHING;";
+      txn.exec(bulk_insert_query);
     }
     txn.commit();
+
+    // 7. FINAL REASSEMBLY: Yield output strictly matching the original blueprint sequence
+    for (const auto &hash : ordered_unique)
+    {
+      if (plan_map.find(hash) != plan_map.end())
+      {
+        missing_plans.push_back(plan_map[hash]);
+      }
+    }
+
     return missing_plans;
   }
-
+  // --- TWO-PHASE COMMIT ---
   void CommitFile(int user_id, const std::string &filename, long long file_size, const std::vector<std::string> &chunk_hashes) override
   {
     pqxx::connection conn(connection_string);
     pqxx::work txn(conn);
+
+    // Determines the exact number of distinct chunks required to assemble this file
+    std::unordered_set<std::string> unique_hashes(chunk_hashes.begin(), chunk_hashes.end());
 
     std::string pg_array = "{";
     for (size_t i = 0; i < chunk_hashes.size(); ++i)
@@ -265,19 +363,35 @@ public:
     }
     pg_array += "}";
 
-    // Inserts the finalized file record using the actual validated user_id
+    // Insert the finalized file record
     txn.exec_params(
         "INSERT INTO files (user_id, filename, size, chunks) VALUES ($1, $2, $3, $4)",
-        user_id,
-        filename,
-        file_size,
-        pg_array);
+        user_id, filename, file_size, pg_array);
 
-    for (const auto &hash : chunk_hashes)
+    // Construct array of unique hashes to minimize redundant SQL updates
+    std::string pg_unique_array = "{";
+    size_t idx = 0;
+    for (const auto &hash : unique_hashes)
     {
-      txn.exec_params(
-          "UPDATE chunks SET ref_count = ref_count + 1, created_at = CURRENT_TIMESTAMP WHERE chunk_hash = $1",
-          hash);
+      pg_unique_array += hash;
+      if (++idx < unique_hashes.size())
+        pg_unique_array += ",";
+    }
+    pg_unique_array += "}";
+
+    // TOCTOU Fix 2: Bulk update ref_counts ONLY if the GC hasn't deleted them
+    pqxx::result res = txn.exec_params(
+        "UPDATE chunks SET ref_count = ref_count + 1, created_at = CURRENT_TIMESTAMP "
+        "WHERE chunk_hash = ANY($1::varchar[]) AND ref_count >= 0",
+        pg_unique_array);
+
+    // Validates that every required chunk successfully incremented.
+    // If the affected rows count is less than the unique hashes count, one or more chunks
+    // were deleted by the GC during the upload window.
+    if (res.affected_rows() != static_cast<int>(unique_hashes.size()))
+    {
+      txn.abort(); // Immediately rollback the files INSERT
+      throw std::runtime_error("COMMIT_FAILED_CHUNK_MISSING");
     }
 
     txn.commit();
