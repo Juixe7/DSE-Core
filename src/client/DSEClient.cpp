@@ -14,6 +14,7 @@
 #include <utility>
 #include <algorithm>
 #include <cstdint>
+#include <unordered_map>
 
 // Monotonic clock selection for reliable interval timing
 using Clock = std::chrono::steady_clock;
@@ -162,6 +163,7 @@ bool DSEClient::UploadFile(const std::string &filepath, std::atomic<TransferStat
     was_hashed_in_session = true;
 
     manifest.completed_chunks.assign(manifest.chunk_hashes.size(), false);
+    manifest.chunk_receipts.resize(manifest.chunk_hashes.size());
     state_manager_->SaveUploadManifest(manifest);
   }
 
@@ -217,7 +219,7 @@ bool DSEClient::UploadFile(const std::string &filepath, std::atomic<TransferStat
 
     bool transfer_success = transfer_manager_->Upload(
         slicer_.get(), state_manager_.get(), filepath, CHUNK_SIZE,
-        pending_tasks, state);
+        pending_tasks, manifest, state);
 
     transfer_duration_sec = std::chrono::duration<double>(Clock::now() - transfer_start_time).count();
     transfer_executed = true;
@@ -247,7 +249,19 @@ bool DSEClient::UploadFile(const std::string &filepath, std::atomic<TransferStat
   auto commit_start_time = Clock::now();
   std::string filename = std::filesystem::path(filepath).filename().string();
 
-  bool commit_success = metadata_client_->CommitFile(filename, initial_size, manifest.chunk_hashes);
+  std::unordered_map<std::string, ChunkReceipt> final_receipts;
+
+  // Correlates the O(1) arrays into a Map format required by the Master Node JSON payload.
+  // Filters exclusively for chunks that successfully bypassed deduplication and were physically verified.
+  for (size_t i = 0; i < manifest.chunk_hashes.size(); ++i)
+  {
+    if (manifest.completed_chunks[i] && !manifest.chunk_receipts[i].receipt.empty())
+    {
+      final_receipts[manifest.chunk_hashes[i]] = manifest.chunk_receipts[i];
+    }
+  }
+
+  bool commit_success = metadata_client_->CommitFile(filename, manifest.chunk_hashes, final_receipts);
   double commit_duration_sec = std::chrono::duration<double>(Clock::now() - commit_start_time).count();
 
   if (commit_success)

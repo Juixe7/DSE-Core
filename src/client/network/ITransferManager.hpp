@@ -19,6 +19,7 @@ public:
   virtual bool Upload(IFileSlicer *slicer, ILocalStateManager *state_manager,
                       const std::string &filepath, size_t chunk_size,
                       const std::vector<std::pair<int, ChunkRoutingPlan>> &pending_tasks,
+                      UploadManifest &manifest,
                       std::atomic<TransferState> *state) = 0;
 
   // Downloads and reassembles chunks from the physical cluster using Direct Memory Access limits.

@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     chunk_hash VARCHAR(64) PRIMARY KEY,
     nodes INTEGER[] NOT NULL,           -- Array of worker_ids: {1, 2}
     ref_count INT DEFAULT 0,
+    size BIGINT DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP 
 );
 

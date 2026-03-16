@@ -24,7 +24,7 @@ public:
   bool HasActiveUpload(const std::string &filepath) override;
   UploadManifest LoadUploadManifest(const std::string &filepath) override;
   void SaveUploadManifest(const UploadManifest &manifest) override;
-  void AppendCompletedIndices(const std::string &filepath, const std::vector<int> &new_indices) override;
+  void AppendProgressLog(const std::string &filepath, const std::vector<ProgressLogEntry> &entries) override;
   void DeleteUploadManifest(const std::string &filepath) override;
 
   void SaveAuthToken(const std::string &token) override;

@@ -212,7 +212,7 @@ public:
     pqxx::connection conn(connection_string);
     pqxx::work txn(conn);
 
-    // 3. THE CTE SUPER-QUERY: Locks -> Updates -> Fetches JSON in ONE round-trip
+    // 3. THE CTE QUERY: Locks -> Updates -> Fetches JSON in ONE round-trip
     pqxx::result existing_res = txn.exec_params(
         "WITH locked AS ("
         "  SELECT c.chunk_hash "
@@ -346,7 +346,7 @@ public:
     return missing_plans;
   }
   // --- TWO-PHASE COMMIT ---
-  void CommitFile(int user_id, const std::string &filename, long long file_size, const std::vector<std::string> &chunk_hashes) override
+  void CommitFile(int user_id, const std::string &filename, const std::vector<std::string> &chunk_hashes, const std::unordered_map<std::string, size_t> &validated_sizes) override
   {
     pqxx::connection conn(connection_string);
     pqxx::work txn(conn);
@@ -354,21 +354,16 @@ public:
     // Determines the exact number of distinct chunks required to assemble this file
     std::unordered_set<std::string> unique_hashes(chunk_hashes.begin(), chunk_hashes.end());
 
-    std::string pg_array = "{";
-    for (size_t i = 0; i < chunk_hashes.size(); ++i)
+    // 1. Zero-Trust Size Enforcement
+    // Updates the physical chunk records with the sizes mathematically verified by the Worker Node receipts.
+    for (const auto &[hash, size] : validated_sizes)
     {
-      pg_array += chunk_hashes[i];
-      if (i < chunk_hashes.size() - 1)
-        pg_array += ",";
+      txn.exec_params(
+          "UPDATE chunks SET size = $1 WHERE chunk_hash = $2 AND ref_count >= 0",
+          size, hash);
     }
-    pg_array += "}";
 
-    // Insert the finalized file record
-    txn.exec_params(
-        "INSERT INTO files (user_id, filename, size, chunks) VALUES ($1, $2, $3, $4)",
-        user_id, filename, file_size, pg_array);
-
-    // Construct array of unique hashes to minimize redundant SQL updates
+    // Construct an array of unique hashes to minimize redundant SQL operations
     std::string pg_unique_array = "{";
     size_t idx = 0;
     for (const auto &hash : unique_hashes)
@@ -379,18 +374,61 @@ public:
     }
     pg_unique_array += "}";
 
-    // TOCTOU Fix 2: Bulk update ref_counts ONLY if the GC hasn't deleted them
+    // 2. Server-Authoritative File Size Calculation
+    // Queries the database to extract the physical sizes of all required chunks.
+    pqxx::result size_res = txn.exec_params(
+        "SELECT chunk_hash, size FROM chunks WHERE chunk_hash = ANY($1::varchar[])",
+        pg_unique_array);
+
+    std::unordered_map<std::string, long long> db_sizes;
+    for (const auto &row : size_res)
+    {
+      db_sizes[row[0].as<std::string>()] = row[1].as<long long>();
+    }
+
+    // Calculates the absolute file size. If a client attempts to commit a file utilizing
+    // hashes that do not physically exist in the database, the transaction is instantly aborted.
+    long long server_calculated_size = 0;
+    for (const std::string &h : chunk_hashes)
+    {
+      if (db_sizes.find(h) != db_sizes.end())
+      {
+        server_calculated_size += db_sizes[h];
+      }
+      else
+      {
+        txn.abort();
+        throw std::runtime_error("COMMIT_FAILED_CHUNK_MISSING");
+      }
+    }
+
+    // Construct the ordered array of hashes for the file record schema
+    std::string pg_array = "{";
+    for (size_t i = 0; i < chunk_hashes.size(); ++i)
+    {
+      pg_array += chunk_hashes[i];
+      if (i < chunk_hashes.size() - 1)
+        pg_array += ",";
+    }
+    pg_array += "}";
+
+    // 3. Insert the finalized file record utilizing the server-calculated size
+    txn.exec_params(
+        "INSERT INTO files (user_id, filename, size, chunks) VALUES ($1, $2, $3, $4)",
+        user_id, filename, server_calculated_size, pg_array);
+
+    // 4. TOCTOU Fix: Bulk update ref_counts ONLY if the GC hasn't deleted them
     pqxx::result res = txn.exec_params(
         "UPDATE chunks SET ref_count = ref_count + 1, created_at = CURRENT_TIMESTAMP "
         "WHERE chunk_hash = ANY($1::varchar[]) AND ref_count >= 0",
         pg_unique_array);
 
-    // Validates that every required chunk successfully incremented.
+    // Validates that every required unique chunk successfully incremented.
     // If the affected rows count is less than the unique hashes count, one or more chunks
-    // were deleted by the GC during the upload window.
+    // were permanently deleted by the GC during the upload window.
     if (res.affected_rows() != static_cast<int>(unique_hashes.size()))
     {
-      txn.abort(); // Immediately rollback the files INSERT
+      txn.abort(); // Instantly rollback the file INSERT and all size updates
       throw std::runtime_error("COMMIT_FAILED_CHUNK_MISSING");
     }
 

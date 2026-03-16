@@ -232,17 +232,24 @@ private:
 
             std::vector<ChunkRoutingPlan> missing = this->db->FilterMissingChunks(client_hashes);
 
+            long long expiry = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count() +
+                               86400; // 24-hour TTL
+
             nlohmann::json missing_json = nlohmann::json::array();
             for (const auto &plan : missing)
             {
                 nlohmann::json nodes_json = nlohmann::json::array();
                 for (const auto &node : plan.assigned_nodes)
                 {
-                    nodes_json.push_back({{"advertised_host", node.advertised_host},
-                                          {"advertised_port", node.advertised_port}});
+                    nodes_json.push_back({{"advertised_host", node.advertised_host}, {"advertised_port", node.advertised_port}});
                 }
-                missing_json.push_back({{"hash", plan.hash},
-                                        {"assigned_nodes", nodes_json}});
+
+                // Generate Ticket
+                std::string ticket = hmac_sha256(plan.hash + std::to_string(expiry), cluster_secret);
+
+                missing_json.push_back({{"hash", plan.hash}, {"assigned_nodes", nodes_json}, {"upload_ticket", ticket}, {"ticket_expiry", expiry}});
             }
             nlohmann::json response = {
                 {"status", "success"},
@@ -283,9 +290,25 @@ private:
             std::string filename = json.at("filename").get<std::string>();
             long long file_size = json.at("file_size").get<long long>();
             std::vector<std::string> chunk_hashes = json.at("chunk_hashes").get<std::vector<std::string>>();
+            std::unordered_map<std::string, size_t> validated_sizes;
 
+            if (json.contains("receipts"))
+            {
+                for (auto &el : json["receipts"].items())
+                {
+                    std::string hash = el.key();
+                    std::string receipt = el.value()["receipt"].get<std::string>();
+                    size_t size = el.value()["size"].get<size_t>();
+
+                    std::string expected_receipt = hmac_sha256(hash + std::to_string(size) + "SUCCESS", cluster_secret);
+                    if (receipt != expected_receipt)
+                        throw std::runtime_error("INVALID_RECEIPT");
+
+                    validated_sizes[hash] = size;
+                }
+            }
             // Commits file bound strictly to the calling user_id to enforce multi-tenancy
-            this->db->CommitFile(user_id, filename, file_size, chunk_hashes);
+            this->db->CommitFile(user_id, filename, chunk_hashes, validated_sizes);
 
             res.status = 200;
             res.set_content(R"({"status": "success"})", "application/json");

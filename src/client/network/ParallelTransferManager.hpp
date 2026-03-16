@@ -14,6 +14,7 @@ public:
   bool Upload(IFileSlicer *slicer, ILocalStateManager *state_manager,
               const std::string &filepath, size_t chunk_size,
               const std::vector<std::pair<int, ChunkRoutingPlan>> &pending_tasks,
+              UploadManifest &manifest,
               std::atomic<TransferState> *state) override;
 
   bool DownloadToFile(const std::vector<DownloadChunkMeta> &ordered_chunks,

@@ -47,21 +47,17 @@ bool LocalStateManager::HasActiveUpload(const std::string &filepath)
   return std::filesystem::exists(manifest_path, fs_error) && std::filesystem::is_regular_file(manifest_path, fs_error);
 }
 
-void LocalStateManager::AppendCompletedIndices(const std::string &filepath, const std::vector<int> &new_indices)
+void LocalStateManager::AppendProgressLog(const std::string &filepath, const std::vector<ProgressLogEntry> &entries)
 {
   std::string log_filename = std::filesystem::path(filepath).filename().string() + ".completed.log";
-  std::filesystem::path full_log_path = transfers_dir / log_filename;
-
-  // Opens stream in append mode to append integer indices without altering existing records
-  std::ofstream log_stream(full_log_path, std::ios::app);
+  std::ofstream log_stream(transfers_dir / log_filename, std::ios::app);
   if (!log_stream.is_open())
-  {
     return;
-  }
 
-  for (int index : new_indices)
+  // Flushes the index, receipt string, and physical chunk size
+  for (const auto &entry : entries)
   {
-    log_stream << index << "\n";
+    log_stream << entry.index << " " << entry.receipt << " " << entry.size << "\n";
   }
 }
 
@@ -79,27 +75,34 @@ UploadManifest LocalStateManager::LoadUploadManifest(const std::string &filepath
   json_stream >> manifest_json;
 
   UploadManifest manifest;
+
+  // 1. Reconstruct Static Metadata
   manifest.filepath = manifest_json.at("filepath").get<std::string>();
   manifest.total_size = manifest_json.at("total_size").get<long long>();
   manifest.temp_modified_timestamp = manifest_json.at("temp_modified_timestamp").get<long long>();
-
-  // Deserializes session_timestamp to enforce the 24-hour server Garbage Collection TTL check
   manifest.session_timestamp = manifest_json.value("session_timestamp", 0LL);
-
   manifest.chunk_hashes = manifest_json.at("chunk_hashes").get<std::vector<std::string>>();
 
-  // Allocates memory for the bitset matching the known chunk sequence length
+  // 2. O(1) Array Pre-allocation
+  // Reserves contiguous RAM blocks exactly matching the blueprint sequence length
   manifest.completed_chunks.assign(manifest.chunk_hashes.size(), false);
+  manifest.chunk_receipts.resize(manifest.chunk_hashes.size());
 
+  // 3. Reconstruct Dynamic Progress
   std::ifstream log_stream(transfers_dir / (file_basename + ".completed.log"));
-  int completed_index;
 
-  // Reads completed chunk indices line-by-line to populate the RAM bitset
-  while (log_stream >> completed_index)
+  int completed_index;
+  std::string receipt_str;
+  size_t chunk_size;
+
+  // Reads the log sequential entries (Index, Receipt, Size) mapping them directly to RAM offsets
+  while (log_stream >> completed_index >> receipt_str >> chunk_size)
   {
+    // Strict bounds checking prevents segfaults in the event of a corrupted log file
     if (completed_index >= 0 && static_cast<size_t>(completed_index) < manifest.completed_chunks.size())
     {
       manifest.completed_chunks[completed_index] = true;
+      manifest.chunk_receipts[completed_index] = {receipt_str, chunk_size};
     }
   }
 

@@ -1,5 +1,6 @@
 #include "ParallelTransferManager.hpp"
 #include "../../common/httplib.h"
+#include "../../common/json.hpp"
 #include "../../common/Semaphore.hpp"
 #include <fstream>
 #include <mutex>
@@ -10,6 +11,9 @@
 #include <future>
 #include <thread>
 #include <chrono>
+#include <vector>
+
+using json = nlohmann::json;
 
 ParallelTransferManager::ParallelTransferManager(std::shared_ptr<ICryptoEngine> crypto_engine)
     : crypto_engine_(std::move(crypto_engine)) {}
@@ -21,7 +25,8 @@ struct SlicerStreamGuard
   ~SlicerStreamGuard() { slicer_ptr->CloseStream(); }
 };
 
-static bool UploadChunkToWorker(const std::string &host, int port, const std::string &hash, const std::vector<char> &data)
+static bool UploadChunkToWorker(const std::string &host, int port, const std::string &hash, const std::vector<char> &data,
+                                const std::string &ticket, long long expiry, ChunkReceipt &out_receipt)
 {
   for (int attempt = 0; attempt < 3; ++attempt)
   {
@@ -29,10 +34,18 @@ static bool UploadChunkToWorker(const std::string &host, int port, const std::st
     {
       httplib::Client client(host, port);
       client.set_connection_timeout(2, 0);
-      auto res = client.Post("/chunk?hash=" + hash, data.data(), data.size(), "application/octet-stream");
+
+      httplib::Headers headers = {
+          {"X-Upload-Ticket", ticket},
+          {"X-Upload-Expiry", std::to_string(expiry)}};
+
+      auto res = client.Post("/chunk?hash=" + hash, headers, data.data(), data.size(), "application/octet-stream");
 
       if (res && res->status == 200)
       {
+        auto json_res = nlohmann::json::parse(res->body);
+        out_receipt.receipt = json_res["receipt"].get<std::string>();
+        out_receipt.size = json_res["size"].get<size_t>();
         return true;
       }
       else if (res)
@@ -40,9 +53,8 @@ static bool UploadChunkToWorker(const std::string &host, int port, const std::st
         std::cerr << "[WARNING] Worker " << host << ":" << port << " rejected upload. HTTP " << res->status << "\n";
       }
     }
-    catch (const std::exception &e)
+    catch (...)
     {
-      std::cerr << "[WARNING] Upload attempt " << attempt + 1 << " to " << host << ":" << port << " failed: " << e.what() << "\n";
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(500 * (1 << attempt)));
   }
@@ -93,7 +105,7 @@ static void DownloadChunkFromReplica(const std::vector<NodeInfo> &nodes, const s
 // Upload method implementation remains structurally identical to our last refinement
 bool ParallelTransferManager::Upload(IFileSlicer *slicer, ILocalStateManager *state_manager,
                                      const std::string &filepath, size_t chunk_size,
-                                     const std::vector<std::pair<int, ChunkRoutingPlan>> &pending_tasks,
+                                     const std::vector<std::pair<int, ChunkRoutingPlan>> &pending_tasks, UploadManifest &manifest,
                                      std::atomic<TransferState> *state)
 {
   httplib::ThreadPool pool(16);
@@ -102,7 +114,7 @@ bool ParallelTransferManager::Upload(IFileSlicer *slicer, ILocalStateManager *st
 
   std::mutex log_mutex;
   bool all_succeeded = true;
-  std::vector<int> pending_disk_writes;
+  std::vector<ProgressLogEntry> pending_disk_writes;
 
   slicer->OpenStream(filepath, chunk_size);
   SlicerStreamGuard guard(slicer);
@@ -134,32 +146,42 @@ bool ParallelTransferManager::Upload(IFileSlicer *slicer, ILocalStateManager *st
       auto promise = std::make_shared<std::promise<bool>>();
       futures.push_back(promise->get_future());
 
-      pool.enqueue([promise, node, hash = plan.hash, index, chunk_payload, permit,
-                    &log_mutex, &pending_disk_writes, filepath, state_manager]() mutable
+      pool.enqueue([promise, node, hash = plan.hash, ticket = plan.upload_ticket, expiry = plan.ticket_expiry, index, chunk_payload, permit, &log_mutex, &pending_disk_writes, &manifest, filepath, state_manager]() mutable
                    {
-                try {
-                    bool success = UploadChunkToWorker(node.advertised_host, node.advertised_port, hash, *chunk_payload);
+        try
+        {
+          ChunkReceipt receipt_data;
+          bool success = UploadChunkToWorker(node.advertised_host, node.advertised_port, hash, *chunk_payload, ticket, expiry, receipt_data);
+          if (success)
+          {
+            std::lock_guard<std::mutex> lock(log_mutex);
+                
+                // O(1) RAM Updates
+                manifest.completed_chunks[index] = true;
+                manifest.chunk_receipts[index] = receipt_data;
+                manifest.successfully_uploaded_count++;
+                
+                pending_disk_writes.push_back({index, receipt_data.receipt, receipt_data.size});
+                
+                // Batch-Flush to Disk
+                if (pending_disk_writes.size() >= 64) {
+                    state_manager->AppendProgressLog(filepath, pending_disk_writes);
+                    pending_disk_writes.clear();
+                }
+          }
 
-                    if (success) {
-                        std::lock_guard<std::mutex> lock(log_mutex);
-                        pending_disk_writes.push_back(index);
-                        if (pending_disk_writes.size() >= 64) {
-                            state_manager->AppendCompletedIndices(filepath, pending_disk_writes);
-                            pending_disk_writes.clear();
-                        }
-                    }
-                    
-                    // Release memory and resolve promise safely
-                    chunk_payload.reset();
-                    permit.reset();
-                    promise->set_value(success);
-                    
-                } catch (...) {
-                    // Safety net: Guarantee the main thread never deadlocks!
-                    chunk_payload.reset();
-                    permit.reset();
-                    promise->set_exception(std::current_exception());
-                } });
+          // Release memory and resolve promise safely
+          chunk_payload.reset();
+          permit.reset();
+          promise->set_value(success);
+        }
+        catch (...)
+        {
+          // Safety net: Guarantee the main thread never deadlocks!
+          chunk_payload.reset();
+          permit.reset();
+          promise->set_exception(std::current_exception());
+        } });
     }
   }
 
@@ -171,7 +193,7 @@ bool ParallelTransferManager::Upload(IFileSlicer *slicer, ILocalStateManager *st
   pool.shutdown();
   if (!pending_disk_writes.empty())
   {
-    state_manager->AppendCompletedIndices(filepath, pending_disk_writes);
+    state_manager->AppendProgressLog(filepath, pending_disk_writes);
     pending_disk_writes.clear();
   }
 
@@ -238,9 +260,13 @@ bool ParallelTransferManager::DownloadToFile(const std::vector<DownloadChunkMeta
     }
   }
 
+  // 1. ADD THE SEMAPHORE
+  Semaphore in_flight_limiter(16);
   std::mutex file_mutex;
   httplib::ThreadPool pool(16);
-  std::vector<std::future<void>> futures;
+
+  // 2. SWITCH TO DEQUE (Void type, relying on exceptions for failure)
+  std::deque<std::future<void>> futures;
   size_t current_offset = 0;
 
   for (size_t i = 0; i < ordered_chunks.size(); ++i)
@@ -249,10 +275,19 @@ bool ParallelTransferManager::DownloadToFile(const std::vector<DownloadChunkMeta
 
     if (state->load() != TransferState::RUNNING)
       break;
+
     if (chunk_completed[i])
     {
       current_offset += chunk.size;
       continue;
+    }
+
+    // 3. DYNAMIC FUTURE REAPING
+    while (!futures.empty() && futures.front().wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+    {
+      // Calling .get() will automatically throw the runtime_error if the worker failed!
+      futures.front().get();
+      futures.pop_front();
     }
 
     auto it = routing_map.find(chunk.hash);
@@ -260,13 +295,18 @@ bool ParallelTransferManager::DownloadToFile(const std::vector<DownloadChunkMeta
       throw std::runtime_error("Missing network route for hash: " + chunk.hash);
 
     auto nodes = it->second;
+
+    // 4. BLOCK THE LOOP IF 16 TASKS ARE ALREADY QUEUED
+    in_flight_limiter.acquire();
+    auto permit = std::make_shared<InFlightPermit>(in_flight_limiter);
+
     auto promise = std::make_shared<std::promise<void>>();
     futures.push_back(promise->get_future());
 
     size_t chunk_offset = current_offset;
     ICryptoEngine *crypto_engine = crypto_engine_.get();
 
-    pool.enqueue([promise, nodes, chunk, chunk_offset, &shared_file, &file_mutex, crypto_engine]()
+    pool.enqueue([promise, nodes, chunk, chunk_offset, &shared_file, &file_mutex, crypto_engine, permit]() mutable
                  {
             try {
                 std::vector<char> chunk_buffer(chunk.size);
@@ -277,17 +317,21 @@ bool ParallelTransferManager::DownloadToFile(const std::vector<DownloadChunkMeta
                     shared_file.seekp(chunk_offset, std::ios::beg);
                     shared_file.write(chunk_buffer.data(), chunk.size);
                 }
+                
+                permit.reset(); // Release semaphore BEFORE unblocking main thread
                 promise->set_value();
             } catch (...) {
+                permit.reset();
                 promise->set_exception(std::current_exception());
             } });
 
     current_offset += chunk.size;
   }
 
+  // 5. AWAIT PIPELINE TAIL
   for (auto &fut : futures)
   {
-    fut.get();
+    fut.get(); // Will throw if a tail task failed
   }
 
   pool.shutdown();

@@ -19,10 +19,30 @@ struct NodeInfo
 };
 
 // Maps a requested data block to its allocated replica set.
+// Add to ChunkRoutingPlan
 struct ChunkRoutingPlan
 {
   std::string hash;
   std::vector<NodeInfo> assigned_nodes;
+
+  // Capability Ticket (Authorization)
+  std::string upload_ticket;
+  long long ticket_expiry;
+};
+
+// New struct for cryptographic receipts
+struct ChunkReceipt
+{
+  std::string receipt;
+  size_t size;
+};
+
+// New struct for the Append-Only Log memory buffer
+struct ProgressLogEntry
+{
+  int index;
+  std::string receipt;
+  size_t size;
 };
 
 // Specifies strict byte boundaries for direct memory access during downloads.
@@ -48,5 +68,6 @@ struct UploadManifest
   long long session_timestamp = 0;
   std::vector<std::string> chunk_hashes;
   std::vector<bool> completed_chunks;
+  std::vector<ChunkReceipt> chunk_receipts;
   int successfully_uploaded_count = 0;
 };

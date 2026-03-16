@@ -44,7 +44,7 @@ public:
   virtual std::vector<ChunkRoutingPlan> FilterMissingChunks(const std::vector<std::string> &client_hashes) = 0;
 
   // Updated to receive the authorized user_id to enforce multi-tenant schema isolation.
-  virtual void CommitFile(int user_id, const std::string &filename, long long file_size, const std::vector<std::string> &chunk_hashes) = 0;
+  virtual void CommitFile(int user_id, const std::string &filename, const std::vector<std::string> &chunk_hashes, const std::unordered_map<std::string, size_t> &validated_sizes) = 0;
 
   // Retrieves the ordered list of chunks and their replicas for authorized file downloads.
   virtual FileDownloadManifest GetDownloadPlan(int user_id, const std::string &filename) = 0;

@@ -19,7 +19,8 @@ public:
   std::string Login(const std::string &email, const std::string &password) override;
 
   std::vector<ChunkRoutingPlan> InitializeUpload(const std::vector<std::string> &chunk_hashes) override;
-  bool CommitFile(const std::string &filename, long long file_size, const std::vector<std::string> &chunk_hashes) override;
+  bool CommitFile(const std::string &filename, const std::vector<std::string> &chunk_hashes,
+                  const std::unordered_map<std::string, ChunkReceipt> &receipts) override;
 
   FileDownloadManifest GetDownloadPlan(const std::string &filename) override;
 
