@@ -2,6 +2,7 @@
 #include "../../common/models.hpp"
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 // Abstract interface for Control Plane operations.
 class IMetadataClient

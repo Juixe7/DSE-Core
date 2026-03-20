@@ -2,8 +2,10 @@
 #include "../common/httplib.h"
 #include "../common/crypto.hpp" // Required for sha256()
 #include "IStorageBackend.hpp"
+#include "../common/json.hpp"
 #include <string>
 
+using json = nlohmann::json;
 class WorkerServer
 {
 private:

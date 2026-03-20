@@ -288,7 +288,7 @@ private:
         {
             auto json = nlohmann::json::parse(req.body);
             std::string filename = json.at("filename").get<std::string>();
-            long long file_size = json.at("file_size").get<long long>();
+            // long long file_size = json.at("file_size").get<long long>();
             std::vector<std::string> chunk_hashes = json.at("chunk_hashes").get<std::vector<std::string>>();
             std::unordered_map<std::string, size_t> validated_sizes;
 

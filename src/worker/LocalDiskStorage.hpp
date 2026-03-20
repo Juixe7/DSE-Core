@@ -20,6 +20,7 @@ private:
   long long in_flight_bytes = 0; // Tracks bytes currently being written
 
   // Checks and reserves disk space atomically to prevent overallocation.
+  // fix required
   bool ReserveSpace(size_t chunk_size_bytes)
   {
     std::lock_guard<std::mutex> lock(storage_mutex);

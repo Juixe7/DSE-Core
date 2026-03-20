@@ -26,5 +26,7 @@ public:
   virtual bool DownloadToFile(const std::vector<DownloadChunkMeta> &ordered_chunks,
                               const std::vector<ChunkRoutingPlan> &plans,
                               const std::string &output_path,
-                              std::atomic<TransferState> *state) = 0;
+                              std::atomic<TransferState> *state,
+                              uint64_t &out_transferred_bytes,
+                              size_t &out_chunks_downloaded) = 0;
 };

@@ -1,6 +1,7 @@
 #pragma once
 #include "IMetadataClient.hpp"
 #include <string>
+#include <unordered_map>
 
 // Concrete implementation of the Control Plane metadata client.
 // Manages stateless HTTP REST communication with the Master Node Load Balancer.

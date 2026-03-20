@@ -34,6 +34,8 @@ static bool UploadChunkToWorker(const std::string &host, int port, const std::st
     {
       httplib::Client client(host, port);
       client.set_connection_timeout(2, 0);
+      client.set_read_timeout(5, 0);
+      client.set_write_timeout(5, 0);
 
       httplib::Headers headers = {
           {"X-Upload-Ticket", ticket},
@@ -71,6 +73,9 @@ static void DownloadChunkFromReplica(const std::vector<NodeInfo> &nodes, const s
     {
       httplib::Client client(node.advertised_host, node.advertised_port);
       client.set_connection_timeout(2, 0);
+      client.set_read_timeout(5, 0);
+      client.set_write_timeout(5, 0);
+
       size_t bytes_written = 0;
 
       auto res = client.Get("/chunk?hash=" + hash, [&](const char *data, size_t data_length)
@@ -204,7 +209,9 @@ bool ParallelTransferManager::Upload(IFileSlicer *slicer, ILocalStateManager *st
 bool ParallelTransferManager::DownloadToFile(const std::vector<DownloadChunkMeta> &ordered_chunks,
                                              const std::vector<ChunkRoutingPlan> &upload_plans,
                                              const std::string &output_path,
-                                             std::atomic<TransferState> *state)
+                                             std::atomic<TransferState> *state,
+                                             uint64_t &out_transferred_bytes,
+                                             size_t &out_chunks_downloaded)
 {
   std::unordered_map<std::string, std::vector<NodeInfo>> routing_map;
   for (const auto &plan : upload_plans)
@@ -237,27 +244,70 @@ bool ParallelTransferManager::DownloadToFile(const std::vector<DownloadChunkMeta
   if (!shared_file)
     throw std::runtime_error("Failed to open file stream.");
 
-  std::vector<bool> chunk_completed(ordered_chunks.size(), false);
+  std::vector<uint8_t> chunk_completed(ordered_chunks.size(), 0);
 
   if (is_resume)
   {
-    std::cout << "[DEBUG] Executing local cryptographic verification on partial file...\n";
+    std::cout << "[DEBUG] Executing parallel cryptographic verification on partial file...\n";
     size_t offset = 0;
+
+    // Uncapped hardware concurrency to fully utilize high-core-count machines
+    unsigned int thread_count = std::max(1u, std::thread::hardware_concurrency());
+    httplib::ThreadPool verify_pool(thread_count);
+
+    std::deque<std::future<void>> verify_futures;
+    Semaphore verify_limiter(32);
+
+    // NO MUTEX NEEDED! Threads write to distinct bytes.
+
     for (size_t i = 0; i < ordered_chunks.size(); ++i)
     {
       if (state->load() != TransferState::RUNNING)
         break;
 
-      std::vector<char> buffer(ordered_chunks[i].size);
-      shared_file.seekg(offset, std::ios::beg);
-      shared_file.read(buffer.data(), buffer.size());
-
-      if (crypto_engine_->ComputeHash(buffer) == ordered_chunks[i].hash)
+      while (!verify_futures.empty() && verify_futures.front().wait_for(std::chrono::seconds(0)) == std::future_status::ready)
       {
-        chunk_completed[i] = true;
+        verify_futures.front().get();
+        verify_futures.pop_front();
       }
+
+      verify_limiter.acquire();
+
+      auto buffer = std::make_shared<std::vector<char>>(ordered_chunks[i].size);
+      shared_file.seekg(offset, std::ios::beg);
+      shared_file.read(buffer->data(), buffer->size());
+
+      auto permit = std::make_shared<InFlightPermit>(verify_limiter);
+      auto promise = std::make_shared<std::promise<void>>();
+      verify_futures.push_back(promise->get_future());
+
+      std::string expected_hash = ordered_chunks[i].hash;
+      ICryptoEngine *crypto_engine = crypto_engine_.get();
+
+      verify_pool.enqueue([promise, buffer, i, expected_hash, crypto_engine, permit, &chunk_completed]() mutable
+                          {
+          try {
+              if (crypto_engine->ComputeHash(*buffer) == expected_hash) {
+                  // LOCK-FREE WRITE: Safe because every index 'i' maps to a unique, non-overlapping byte.
+                  chunk_completed[i] = 1; 
+              }
+              buffer.reset();
+              permit.reset();
+              promise->set_value();
+          } catch (...) {
+              buffer.reset();
+              permit.reset();
+              promise->set_exception(std::current_exception());
+          } });
+
       offset += ordered_chunks[i].size;
     }
+
+    for (auto &fut : verify_futures)
+    {
+      fut.get();
+    }
+    verify_pool.shutdown();
   }
 
   // 1. ADD THE SEMAPHORE
@@ -268,6 +318,10 @@ bool ParallelTransferManager::DownloadToFile(const std::vector<DownloadChunkMeta
   // 2. SWITCH TO DEQUE (Void type, relying on exceptions for failure)
   std::deque<std::future<void>> futures;
   size_t current_offset = 0;
+
+  uint64_t local_transferred_bytes = 0;
+  size_t local_chunks_downloaded = 0;
+  bool all_succeeded = true;
 
   for (size_t i = 0; i < ordered_chunks.size(); ++i)
   {
@@ -281,15 +335,24 @@ bool ParallelTransferManager::DownloadToFile(const std::vector<DownloadChunkMeta
       current_offset += chunk.size;
       continue;
     }
+    local_transferred_bytes += chunk.size;
+    local_chunks_downloaded++;
 
     // 3. DYNAMIC FUTURE REAPING
     while (!futures.empty() && futures.front().wait_for(std::chrono::seconds(0)) == std::future_status::ready)
     {
-      // Calling .get() will automatically throw the runtime_error if the worker failed!
-      futures.front().get();
+      try
+      {
+        futures.front().get();
+      }
+      catch (...)
+      {
+        all_succeeded = false;
+      }
       futures.pop_front();
     }
-
+    if (!all_succeeded)
+      break;
     auto it = routing_map.find(chunk.hash);
     if (it == routing_map.end())
       throw std::runtime_error("Missing network route for hash: " + chunk.hash);
@@ -331,9 +394,18 @@ bool ParallelTransferManager::DownloadToFile(const std::vector<DownloadChunkMeta
   // 5. AWAIT PIPELINE TAIL
   for (auto &fut : futures)
   {
-    fut.get(); // Will throw if a tail task failed
+    try
+    {
+      fut.get(); // Will throw if a tail task failed
+    }
+    catch (...)
+    {
+      all_succeeded = false;
+    }
   }
 
   pool.shutdown();
-  return state->load() == TransferState::RUNNING;
+  out_transferred_bytes = local_transferred_bytes;
+  out_chunks_downloaded = local_chunks_downloaded;
+  return all_succeeded && state->load() == TransferState::RUNNING;
 }

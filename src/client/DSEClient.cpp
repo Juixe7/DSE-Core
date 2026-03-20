@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <unordered_map>
+#include <thread>
 
 // Monotonic clock selection for reliable interval timing
 using Clock = std::chrono::steady_clock;
@@ -378,14 +379,18 @@ bool DSEClient::DownloadFile(const std::string &filename, const std::string &out
   }
 
   std::string temp_path = output_path + ".dse_download";
+  bool is_resume_session = std::filesystem::exists(temp_path);
   std::cout << "[DEBUG] Pulling " << ordered_chunks.size() << " chunks from cluster...\n";
 
   auto transfer_start_time = Clock::now();
   bool download_completed = false;
 
+  uint64_t transferred_bytes = 0;
+  size_t chunks_downloaded = 0;
+
   try
   {
-    download_completed = transfer_manager_->DownloadToFile(ordered_chunks, manifest.plans, temp_path, state);
+    download_completed = transfer_manager_->DownloadToFile(ordered_chunks, manifest.plans, temp_path, state, transferred_bytes, chunks_downloaded);
   }
   catch (const std::exception &e)
   {
@@ -396,32 +401,63 @@ bool DSEClient::DownloadFile(const std::string &filename, const std::string &out
 
   if (download_completed)
   {
-    std::filesystem::rename(temp_path, output_path);
+    std::error_code rename_ec;
+
+    if (std::filesystem::exists(output_path, rename_ec))
+    {
+      std::filesystem::remove(output_path, rename_ec);
+    }
+
+    for (int i = 0; i < 5; ++i)
+    {
+      std::filesystem::rename(temp_path, output_path, rename_ec);
+      if (!rename_ec)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    if (rename_ec)
+    {
+      std::cerr << "[ERROR] Could not finalize file rename (Windows File Lock): " << rename_ec.message() << "\n";
+      std::cerr << "[INFO] Your file is safely downloaded at: " << temp_path << "\n";
+      return false;
+    };
     double total_duration_sec = std::chrono::duration<double>(Clock::now() - total_start_time).count();
 
     // --- ACCURATE TELEMETRY & BENCHMARK REPORTING ---
     double size_mb = static_cast<double>(manifest.file_size) / (1024.0 * 1024.0);
+    double transferred_mb = static_cast<double>(transferred_bytes) / (1024.0 * 1024.0);
 
-    std::cout << "\n"
-              << "====================================================\n"
+    uint64_t local_bytes = manifest.file_size - transferred_bytes;
+    double local_mb = static_cast<double>(local_bytes) / (1024.0 * 1024.0);
+    size_t chunks_already_local = ordered_chunks.size() - chunks_downloaded;
+
+    double resume_pct = (manifest.file_size > 0) ? (static_cast<double>(local_bytes) / static_cast<double>(manifest.file_size)) * 100.0 : 0.0;
+
+    std::cout << "\n====================================================\n"
               << "           DOWNLOAD PERFORMANCE TELEMETRY           \n"
               << "====================================================\n"
               << std::fixed << std::setprecision(3)
               << "File Name             : " << filename << "\n"
               << "File Size             : " << size_mb << " MB (" << manifest.file_size << " bytes)\n"
-              << "Total Chunks Fetched  : " << ordered_chunks.size() << "\n"
+              << "Session Type          : " << (is_resume_session ? "Resumed Session" : "New Download") << "\n"
+              << "Total Chunks          : " << ordered_chunks.size() << "\n"
+              << "Chunks Already Local  : " << chunks_already_local << "\n"
+              << "Chunks Downloaded     : " << chunks_downloaded << "\n"
+              << "Transferred Volume    : " << transferred_mb << " MB (" << transferred_bytes << " bytes)\n"
+              << "Network Reduction     : " << local_mb << " MB (" << resume_pct << "%)\n"
               << "----------------------------------------------------\n"
               << "Metadata Retrieval    : " << plan_duration_sec << " s\n";
 
-    if (transfer_duration_sec > 0.000001)
+    if (transfer_duration_sec > 0.000001 && transferred_bytes > 0)
     {
-      double data_plane_mb_s = size_mb / transfer_duration_sec;
+      double data_plane_mb_s = transferred_mb / transfer_duration_sec;
       double data_plane_mbps = data_plane_mb_s * 8.0;
       std::cout << "Data Plane Transfer   : " << transfer_duration_sec << " s (" << data_plane_mb_s << " MB/s | " << data_plane_mbps << " Mbps)\n";
     }
     else
     {
-      std::cout << "Data Plane Transfer   : " << transfer_duration_sec << " s\n";
+      std::cout << "Data Plane Transfer   : " << transfer_duration_sec << " s (Zero network bytes transmitted)\n";
     }
 
     std::cout << "----------------------------------------------------\n"
