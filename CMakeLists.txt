@@ -66,6 +66,7 @@ add_executable(client_cli
 # Enforce target-specific include directories
 target_include_directories(client_cli PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/client
 )
 
 # Link the client to multithreading and OpenSSL

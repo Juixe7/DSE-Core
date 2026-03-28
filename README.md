@@ -1,4 +1,4 @@
-# Distributed Storage Platform
+# DSE-Core: Zero-Trust Distributed Object Storage Platform
 
 *A Zero-Trust Distributed Object Storage Platform written in Modern C++17*
 
@@ -20,6 +20,23 @@ This project is a distributed object storage platform written in modern C++17. I
 ### Architecture
 - **Active-Active Masters**
 - **Zero-Trust Upload Authorization**
+
+---
+
+## Quick Start
+
+### 1. Launch Multi-Node Cluster
+Ensure Docker Desktop is running, then boot the 7-node cluster:
+```bash
+docker compose up -d
+```
+The cluster runs 2 active-active Master nodes behind an NGINX Layer-7 load balancer on `http://localhost:8088`, PostgreSQL 15 on `localhost:5433`, and 4 storage worker nodes on ports `9001-9004`.
+
+### 2. Run End-to-End Test Suite
+Run the automated Python test suite to verify cluster bootstrap, capability tickets, worker replication, zero-copy deduplication, and byte-for-byte SHA-256 retrieval verification:
+```bash
+python tests/main.py
+```
 
 ---
 
@@ -189,4 +206,4 @@ While the current prototype handles deterministic scaling well, the following ar
 This platform demonstrates that moving hashing, deduplication, and transfer orchestration to the client enables a scalable, memory-bounded distributed storage architecture while maintaining strong security guarantees through a Zero-Trust protocol.
 
 ---
-*Created by Varun Gupta*
+*Created by Juixe7 (Avadh Khandelwal)*

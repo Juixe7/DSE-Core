@@ -1,8 +1,9 @@
+import os
 import sys
 import hashlib
 import requests
 
-MASTER_URL = "http://localhost:80"  # NGINX Load Balancer
+MASTER_URL = os.environ.get("MASTER_URL", "http://localhost:8088")  # NGINX Load Balancer
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 def sha256_hash(data):
@@ -18,7 +19,13 @@ def execute_e2e_test():
     print("        Note: Verify worker IDs by inspecting the database 'worker_nodes' table.")
     
     # Prompt the operator for registered worker IDs at runtime
-    worker_ids_input = input("        Enter active worker IDs to register as Cluster 1 (comma-separated, e.g. 1,2): ")
+    default_workers = os.environ.get("BOOTSTRAP_WORKERS", "1,2")
+    try:
+        worker_ids_input = input(f"        Enter active worker IDs to register as Cluster 1 (comma-separated, default: {default_workers}): ").strip()
+    except EOFError:
+        worker_ids_input = ""
+    if not worker_ids_input:
+        worker_ids_input = default_workers
     try:
         active_node_ids = [int(x.strip()) for x in worker_ids_input.split(",") if x.strip().isdigit()]
     except Exception as e:
@@ -61,6 +68,14 @@ def execute_e2e_test():
         print(f"[FAIL] User provisioning failed with status: {signup_response.status_code}")
         sys.exit(1)
 
+    login_response = requests.post(f"{MASTER_URL}/auth/login", json=signup_payload)
+    if login_response.status_code != 200:
+        print(f"[FAIL] Login failed with status: {login_response.status_code}")
+        sys.exit(1)
+    token = login_response.json().get("token")
+    auth_headers = {"Authorization": f"Bearer {token}"}
+    print("        PASS: Authenticated session established.")
+
     # ---------------------------------------------------------
     # PHASE 1: DATA INGESTION (FILE A)
     # ---------------------------------------------------------
@@ -77,7 +92,7 @@ def execute_e2e_test():
     # 2. Request upload initialization for File A
     print("\n[2/9] Initializing upload for File A on Control Plane...")
     init_payload = {"hashes": chunk_hashes}
-    init_response = requests.post(f"{MASTER_URL}/upload-init", json=init_payload)
+    init_response = requests.post(f"{MASTER_URL}/upload-init", json=init_payload, headers=auth_headers)
     
     if init_response.status_code != 200:
         print(f"[FAIL] Upload initialization failed with status: {init_response.status_code}")
@@ -88,12 +103,15 @@ def execute_e2e_test():
     print(f"      Master reports {len(missing_hashes)} missing chunks to be physically uploaded.")
 
     routing_map = {}
+    receipts = {}
 
     # 3. Perform physical binary uploads to ALL assigned replica Workers (Replication)
     print("\n[3/9] Transferring binary chunks to ALL replica Workers (Direct Client Replication)...")
     for item in missing_hashes:
         chunk_hash = item["hash"]
         assigned_nodes = item["assigned_nodes"]
+        upload_ticket = item.get("upload_ticket", "")
+        ticket_expiry = str(item.get("ticket_expiry", ""))
         
         if not assigned_nodes:
             print(f"[FAIL] No active worker nodes assigned to chunk: {chunk_hash}")
@@ -112,19 +130,34 @@ def execute_e2e_test():
             worker_url = f"http://{worker_ip}:{worker_port}/chunk?hash={chunk_hash}"
             print(f"      Replicating chunk {chunk_hash[:12]}... -> Direct to Worker ({worker_ip}:{worker_port})")
             
-            upload_response = requests.post(worker_url, data=binary_payload, headers={"Content-Type": "application/octet-stream"})
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "X-Upload-Ticket": upload_ticket,
+                "X-Upload-Expiry": ticket_expiry
+            }
+            upload_response = requests.post(worker_url, data=binary_payload, headers=headers)
             if upload_response.status_code != 200:
                 print(f"[FAIL] Replicated upload failed at ({worker_ip}:{worker_port}) with status: {upload_response.status_code}")
+                print(upload_response.text)
                 sys.exit(1)
+            try:
+                res_data = upload_response.json()
+                receipts[chunk_hash] = {
+                    "size": res_data.get("size", len(binary_payload)),
+                    "receipt": res_data.get("receipt", "")
+                }
+            except Exception:
+                pass
 
     # 4. Commit File A to the Control Plane
     print("\n[4/9] Committing File A metadata to Master...")
     commit_payload = {
         "filename": "file_A.txt",
         "file_size": len(original_data),
-        "chunk_hashes": chunk_hashes
+        "chunk_hashes": chunk_hashes,
+        "receipts": receipts
     }
-    commit_response = requests.post(f"{MASTER_URL}/files/commit", json=commit_payload)
+    commit_response = requests.post(f"{MASTER_URL}/files/commit", json=commit_payload, headers=auth_headers)
     if commit_response.status_code != 200:
         print(f"[FAIL] File A commit failed: {commit_response.text}")
         sys.exit(1)
@@ -135,7 +168,7 @@ def execute_e2e_test():
     # ---------------------------------------------------------
     print("\n[5/9] Verifying Deduplication Engine (Zero-Copy Upload)...")
     init_payload_dup = {"hashes": chunk_hashes}
-    init_response_dup = requests.post(f"{MASTER_URL}/upload-init", json=init_payload_dup)
+    init_response_dup = requests.post(f"{MASTER_URL}/upload-init", json=init_payload_dup, headers=auth_headers)
     
     if init_response_dup.status_code != 200:
         print(f"[FAIL] Upload initialization for duplicate file failed.")
@@ -157,7 +190,7 @@ def execute_e2e_test():
         "file_size": len(original_data),
         "chunk_hashes": chunk_hashes
     }
-    commit_response_dup = requests.post(f"{MASTER_URL}/files/commit", json=commit_payload_dup)
+    commit_response_dup = requests.post(f"{MASTER_URL}/files/commit", json=commit_payload_dup, headers=auth_headers)
     if commit_response_dup.status_code != 200:
         print(f"[FAIL] File B commit failed: {commit_response_dup.text}")
         sys.exit(1)
@@ -216,9 +249,27 @@ def execute_e2e_test():
     # PHASE 4: ADMINISTRATIVE IN-PLACE CLUSTER REPLACE
     # ---------------------------------------------------------
     print("[9/9] Testing Administrative Scaling: In-Place Cluster Replacement / Sealing")
-    replace_input = input("      Do you want to replace the worker nodes of Cluster 1? (y/n): ")
-    if replace_input.strip().lower() == 'y':
-        new_workers_input = input("      Enter new worker IDs to swap in (comma-separated, e.g. 3,4): ")
+    try:
+        replace_input = input("      Do you want to replace the worker nodes of Cluster 1? (y/n, default: y): ").strip()
+    except EOFError:
+        replace_input = os.environ.get("AUTO_REPLACE", "y")
+    if not replace_input:
+        replace_input = "y"
+    if replace_input.lower() == 'y':
+        default_cluster_id = os.environ.get("TARGET_CLUSTER_ID", "1")
+        try:
+            cluster_id_input = input(f"      Enter Cluster ID to replace (default: {default_cluster_id}): ").strip()
+        except EOFError:
+            cluster_id_input = ""
+        target_cluster_id = int(cluster_id_input) if cluster_id_input.isdigit() else int(default_cluster_id)
+
+        default_swap = os.environ.get("SWAP_WORKERS", "3,4")
+        try:
+            new_workers_input = input(f"      Enter new worker IDs to swap in (comma-separated, default: {default_swap}): ").strip()
+        except EOFError:
+            new_workers_input = ""
+        if not new_workers_input:
+            new_workers_input = default_swap
         try:
             new_worker_ids = [int(x.strip()) for x in new_workers_input.split(",") if x.strip().isdigit()]
         except Exception as e:
@@ -230,7 +281,7 @@ def execute_e2e_test():
             sys.exit(1)
             
         replace_payload = {
-            "cluster_id": 1,
+            "cluster_id": target_cluster_id,
             "new_worker_ids": new_worker_ids
         }
         

@@ -18,6 +18,14 @@ CMakeFiles/
 *.sln
 *.vcxproj
 
-# Local database volumes 
+# Local database volumes & runtime state
 pgdata/
 data/
+.dse_client/
+*.log
+__pycache__/
+*.tmp
+
+# Documentation drafts & PDFs
+*.pdf
+dss_report*.pdf
